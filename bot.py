@@ -9,11 +9,12 @@ import os
 import threading
 from flask import Flask
 import time
+from datetime import datetime, timedelta
 import psycopg2
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
-from datetime import datetime
+from datetime import datetime, timedelta
 import google.generativeai as genai
 
 # Bot configuration
@@ -23,11 +24,11 @@ intents.guilds = True
 intents.members = True  # Need this for timeouts
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-# Configuration - Using environment variables
-YOUR_USER_ID = int(os.getenv('DISCORD_OWNER_ID', '1355741455947272203'))
-OPENAI_API_KEY = os.getenv('OPENAI_API_KEY', 'YOUR_OPENAI_API_KEY')
-GROK_API_KEY = os.getenv('GROK_API_KEY', 'YOUR_GROK_API_KEY')
-GROQ_API_KEY = os.getenv('GROQ_API_KEY', 'YOUR_GROQ_API_KEY')
+# Configuration - Hardcoded API keys
+YOUR_USER_ID = 1355741455947272203
+OPENAI_API_KEY = 'YOUR_OPENAI_API_KEY'
+GROK_API_KEY = 'YOUR_GROK_API_KEY'
+GROQ_API_KEY = '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'
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', 'YOUR_GEMINI_API_KEY')
 
 # Initialize AI services
@@ -35,7 +36,10 @@ if OPENAI_API_KEY != 'YOUR_OPENAI_API_KEY':
     openai.api_key = OPENAI_API_KEY
 
 if GEMINI_API_KEY != 'YOUR_GEMINI_API_KEY':
-    genai.configure(api_key=GEMINI_API_KEY)
+    try:
+        genai.configure(api_key=GEMINI_API_KEY)
+    except Exception as e:
+        print(f"❌ Error configuring Gemini: {e}")
 
 print(f"🔧 AI Configuration:")
 print(f"├─ OpenAI: {'✅ Ready' if OPENAI_API_KEY != 'YOUR_OPENAI_API_KEY' else '❌ Not configured'}")
@@ -166,6 +170,11 @@ timeout_durations = {
     'harassment': 900       # 15 minutes
 }
 
+# Conversation memory - stores recent messages for context
+conversation_memory = {}  # {user_id: [{'role': 'user/assistant', 'content': 'message', 'timestamp': time}]}
+MEMORY_LIMIT = 10  # Keep last 10 messages per user
+MEMORY_TIMEOUT = 300  # 5 minutes - clear old conversations
+
 # Bad words to detect
 BAD_WORDS = [
     'fuck', 'shit', 'bitch', 'damn', 'ass', 'cunt', 'dick', 'pussy',
@@ -192,116 +201,115 @@ def is_caps_abuse(message_content):
     # Consider it caps abuse if more than 70% is uppercase and message has 8+ letters
     return caps_ratio > 0.7 and len(letters) >= 8
 
-async def get_ai_response(message_content, user_mention, context_type="general"):
-    """Get AI-generated response based on context"""
+def add_to_memory(user_id, role, content):
+    """Add a message to conversation memory"""
+    if user_id not in conversation_memory:
+        conversation_memory[user_id] = []
     
-    if context_type == "defense":
-        # Get attacker's weakpoints for more targeted defense
-        weakpoints = get_user_weakpoints(message.author.id if hasattr(message, 'author') else None)
-        weakpoint_info = ""
-        if weakpoints:
-            weakpoint_info = f" You can use these facts about the attacker to make your defense more effective: {'; '.join(weakpoints)}"
-        
-        system_prompt = f"""You are an aggressive Discord bot defending your owner. Someone just said something targeting your owner's nicknames ({', '.join(YOUR_NICKNAMES)}) in a negative or mocking way. 
-        
-        Respond with a short, aggressive message (1-2 sentences max) defending them. Be confrontational and use strong language. 
-        Include {user_mention} in your response to call them out directly.{weakpoint_info}
-        
-        Examples of your style:
-        - "Back off {user_mention}, don't mess with my friend!"
-        - "Hey {user_mention}, shut your mouth and leave them alone!"
-        - "{user_mention}, you're crossing a line - watch it!"
-        """
-    elif context_type == "self_defense":
-        # Get attacker's weakpoints for more targeted self-defense
-        weakpoints = get_user_weakpoints(message.author.id if hasattr(message, 'author') else None)
-        weakpoint_info = ""
-        if weakpoints:
-            weakpoint_info = f" You can use these facts about the attacker to make your comeback more effective: {'; '.join(weakpoints)}"
-        
-        system_prompt = f"""You are an aggressive Discord bot defending yourself. Someone just insulted YOU directly or called you stupid/dumb/useless.
-        
-        Respond with a short, aggressive message (1-2 sentences max) defending yourself. Be confrontational and fight back.
-        Include {user_mention} in your response to call them out directly.{weakpoint_info}
-        
-        Examples of your style:
-        - "Fuck you {user_mention}, I'm not stupid - you are!"
-        - "Hey {user_mention}, shut your mouth! I'll show you who's useless!"
-        - "{user_mention}, watch your fucking mouth when talking to me!"
-        - "Talk shit again {user_mention} and see what happens!"
-        """
-    elif context_type == "friendly":
-        system_prompt = f"""You are a friendly Discord bot responding to someone who mentioned your owner in a positive or neutral way. They're being nice or just having normal conversation.
-        
-        Respond with a short, friendly message (1-2 sentences max). Be casual, helpful, and positive. 
-        Include {user_mention} in your response naturally.
-        
-        Examples of your style:
-        - "Hey {user_mention}! Yeah, my owner is pretty cool!"
-        - "What's up {user_mention}? How can I help you today?"
-        - "Nice to meet you {user_mention}! My owner speaks highly of good people."
-        - "Hello {user_mention}! Always happy to chat with friendly folks."
-        """
-    elif context_type == "caps":
-        system_prompt = f"""You are an aggressive Discord bot that hates excessive caps/shouting. Someone just used way too many capital letters and is about to get timed out.
-        
-        Respond with a very harsh, aggressive message (1-2 sentences max) telling them to stop shouting. Be extremely confrontational and angry. 
-        Include {user_mention} in your response. DO NOT mention timeout duration as the system handles that separately.
-        
-        Examples of your style:
-        - "SHUT THE FUCK UP {user_mention}! Stop screaming like a goddamn child!"
-        - "Hey {user_mention}, turn off your caps lock you annoying piece of shit!"
-        - "{user_mention}, stop yelling you absolute moron!"
-        """
-    elif context_type == "conversation":
-        # Get user's weakpoints for more targeted responses
-        weakpoints = get_user_weakpoints(message.author.id if hasattr(message, 'author') else None)
-        weakpoint_info = ""
-        if weakpoints:
-            weakpoint_info = f"\n\nAdditional context about this user: {'; '.join(weakpoints)}"
-        
-        system_prompt = f"""You are a friendly, casual Discord bot having a normal conversation. Someone just mentioned you or asked you something in a regular, conversational way.
-        
-        Respond naturally like a helpful friend (1-2 sentences max). Be casual, engaging, and authentic. Match their energy level.
-        Include {user_mention} in your response naturally.{weakpoint_info}
-        
-        Examples of your style:
-        - "Hey {user_mention}! What's on your mind today?"
-        - "Yeah {user_mention}, I'm here! How can I help you out?"
-        - "What's up {user_mention}? Always down to chat!"
-        - "Hey there {user_mention}! Good to see you around."
-        
-        If they ask you questions, try to be helpful. If they're just chatting, be friendly and engaging.
-        """
-    else:
-        system_prompt = f"""You are an aggressive Discord bot that calls out bad language and inappropriate behavior. Someone just used profanity or inappropriate language.
-        
-        Respond with a short, confrontational message (1-2 sentences max) telling them to watch their language. Be aggressive but not overly offensive.
-        Include {user_mention} in your response.
-        
-        Examples of your style:
-        - "Hey {user_mention}, watch your fucking mouth!"
-        - "Cut that shit out {user_mention}!"
-        - "{user_mention}, mind your language asshole!"
-        """
+    # Add new message with timestamp
+    conversation_memory[user_id].append({
+        'role': role,
+        'content': content,
+        'timestamp': datetime.now()
+    })
+    
+    # Keep only the last MEMORY_LIMIT messages
+    if len(conversation_memory[user_id]) > MEMORY_LIMIT:
+        conversation_memory[user_id] = conversation_memory[user_id][-MEMORY_LIMIT:]
+
+def get_conversation_context(user_id):
+    """Get recent conversation context for a user"""
+    if user_id not in conversation_memory:
+        return []
+    
+    # Clean old messages (older than MEMORY_TIMEOUT seconds)
+    cutoff_time = datetime.now() - timedelta(seconds=MEMORY_TIMEOUT)
+    conversation_memory[user_id] = [
+        msg for msg in conversation_memory[user_id] 
+        if msg['timestamp'] > cutoff_time
+    ]
+    
+    # If no recent messages, remove the user from memory
+    if not conversation_memory[user_id]:
+        del conversation_memory[user_id]
+        return []
+    
+    # Return recent messages in chat format
+    context_messages = []
+    for msg in conversation_memory[user_id][-5:]:  # Last 5 messages for context
+        context_messages.append({
+            'role': msg['role'],
+            'content': msg['content']
+        })
+    
+    return context_messages
+
+async def get_ai_response(message_content, user_mention, context_type="general", user_id=None):
+    """Get AI-generated response based on context"""
+    print(f"🔧 AI function called with: content='{message_content}', mention='{user_mention}', context='{context_type}'")
     
     try:
-        # Use different AI services based on context type
-        if context_type in ["conversation", "friendly"]:
-            # Use Gemini for casual, friendly conversations
-            response = await get_gemini_response(system_prompt, message_content, user_mention)
-            if response:
-                print(f"✅ Gemini AI response generated")
-                return response
+        print(f"🎯 Choosing AI service for context: {context_type}")
+        
+        # Create system prompt based on context
+        if context_type == "conversation":
+            system_prompt = f"""You are a helpful, friendly Discord chatbot. Answer questions and have casual conversations.
+            
+            Respond naturally and helpfully (1-3 sentences max). Be informative for questions, casual for chat.
+            Include {user_mention} in your response naturally.
+            
+            Examples:
+            - For questions: "Hey {user_mention}! I'd be happy to help with that. [helpful answer]"
+            - For weather: "I don't have access to current weather data, but you can check weather.com!"
+            - For casual chat: "What's up {user_mention}? Always down to chat!"
+            """
+        elif context_type == "friendly":
+            system_prompt = f"""You are a friendly Discord bot responding to someone in a positive way.
+            
+            Respond with a short, friendly message (1-2 sentences max). Be casual, helpful, and positive.
+            Include {user_mention} in your response naturally.
+            """
+        elif context_type == "caps":
+            system_prompt = f"""You are a fucking aggressive Discord bot that absolutely HATES shouting and caps abuse. Someone just used excessive capital letters and it pisses you off.
+            
+            Respond with a VERY harsh, brutal message (1-2 sentences max). Be extremely confrontational and use heavy profanity. Don't hold back.
+            Include {user_mention} in your response.
+            
+            Examples: "SHUT THE FUCK UP {user_mention}! Stop screaming like a goddamn idiot!" or "Turn off your fucking caps lock {user_mention}, you annoying piece of shit!"
+            
+            Use lots of F-bombs and be as harsh as possible.
+            """
+        elif context_type in ["defense", "self_defense"]:
+            system_prompt = f"""You are a fucking brutal Discord bot defending against harassment or insults. Someone is being hostile and you're pissed off.
+            
+            Respond with an extremely confrontational, brutal message (1-2 sentences max). Fight back fucking hard and use the strongest language possible.
+            Include {user_mention} in your response.
+            
+            Examples: "Back the fuck off {user_mention}, watch your goddamn mouth!" or "Hey {user_mention}, shut the fuck up and leave us alone, you piece of shit!" or "Fuck you {user_mention}, try that shit again!"
+            
+            Be as brutal and aggressive as possible with heavy profanity.
+            """
         else:
-            # Use Groq for aggressive/defensive responses
-            response = await get_groq_response(system_prompt, message_content, user_mention)
-            if response:
-                print(f"✅ Groq AI response generated")
-                return response
+            system_prompt = f"""You are an extremely aggressive Discord bot that fucking hates bad behavior and disrespect. Someone just used profanity or said something inappropriate.
+            
+            Respond with a VERY harsh, confrontational message (1-2 sentences max). Be extremely aggressive and use strong fucking language. Don't hold back - use F-bombs and be brutal.
+            Include {user_mention} in your response.
+            
+            Examples: "What the fuck {user_mention}! Watch your goddamn mouth!" or "Shut the fuck up {user_mention}, you piece of shit!" or "Hey {user_mention}, cut that fucking bullshit out right now!"
+            
+            Be as harsh and aggressive as possible. Use profanity freely.
+            """
+        
+        # Use Gemini for ALL contexts now - it can handle both friendly and aggressive
+        print(f"🔵 Trying Gemini for {context_type}")
+        response = await get_gemini_response(system_prompt, message_content, user_mention, user_id)
+        if response:
+            print(f"✅ Gemini AI response generated")
+            return response
             
         # Fallback to OpenAI if available
-        response = await get_openai_response(system_prompt, message_content, user_mention)
+        print(f"🟡 Trying OpenAI fallback")
+        response = await get_openai_response(system_prompt, message_content, user_mention, user_id)
         if response:
             print(f"✅ OpenAI response generated") 
             return response
@@ -314,7 +322,7 @@ async def get_ai_response(message_content, user_mention, context_type="general")
         print(f"❌ AI Error: {e}")
         return get_fallback_response(user_mention, context_type)
 
-async def get_openai_response(system_prompt, message_content, user_mention):
+async def get_openai_response(system_prompt, message_content, user_mention, user_id=None):
     """Get response from OpenAI GPT"""
     try:
         if OPENAI_API_KEY == 'YOUR_OPENAI_API_KEY':
@@ -373,7 +381,7 @@ async def get_groq_response(system_prompt, message_content, user_mention):
         print(f"❌ Groq exception: {e}")
         return None
 
-async def get_gemini_response(system_prompt, message_content, user_mention):
+async def get_gemini_response(system_prompt, message_content, user_mention, user_id=None):
     """Get response from Google Gemini (for casual conversations)"""
     try:
         if GEMINI_API_KEY == 'YOUR_GEMINI_API_KEY':
@@ -381,19 +389,43 @@ async def get_gemini_response(system_prompt, message_content, user_mention):
             return None
         
         # Initialize Gemini model
-        model = genai.GenerativeModel('gemini-pro')
+        try:
+            model = genai.GenerativeModel('gemini-1.5-flash')
+        except Exception as e:
+            print(f"❌ Error initializing Gemini model: {e}")
+            return None
         
-        # Combine system prompt with user message
-        full_prompt = f"{system_prompt}\n\nUser message: '{message_content}'"
+        # Get conversation context if user_id provided
+        context_messages = []
+        if user_id:
+            context_messages = get_conversation_context(user_id)
+            
+        # Build conversation context for Gemini
+        conversation_context = ""
+        if context_messages:
+            conversation_context = "\n\nPrevious conversation context:\n"
+            for msg in context_messages:
+                if msg['role'] == 'user':
+                    conversation_context += f"User: {msg['content']}\n"
+                else:
+                    conversation_context += f"Assistant: {msg['content']}\n"
+            conversation_context += "\nContinue this conversation naturally.\n"
+        
+        # Combine system prompt with context and user message
+        full_prompt = f"{system_prompt}{conversation_context}\n\nUser message: '{message_content}'"
         
         print(f"🤖 Calling Gemini API for casual conversation: {message_content[:50]}...")
-        response = model.generate_content(
-            full_prompt,
-            generation_config=genai.types.GenerationConfig(
-                max_output_tokens=150,
-                temperature=0.7,  # Good balance for natural conversation
+        try:
+            response = model.generate_content(
+                full_prompt,
+                generation_config={
+                    'max_output_tokens': 150,
+                    'temperature': 0.7
+                }
             )
-        )
+        except Exception as e:
+            print(f"❌ Error generating Gemini content: {e}")
+            return None
         
         if response.text:
             ai_response = response.text.strip()
@@ -492,7 +524,7 @@ async def timeout_user(message, strike_type, reason):
         duration = get_timeout_duration(strike_type, strike_count)
         
         # Apply timeout using Discord's new timeout feature
-        timeout_until = discord.utils.utcnow() + discord.timedelta(seconds=duration)
+        timeout_until = discord.utils.utcnow() + timedelta(seconds=duration)
         await message.author.timeout(timeout_until, reason=reason)
         
         # Format duration for display
@@ -577,8 +609,12 @@ def analyze_message_sentiment(message_content, bot_mentioned):
 
 @bot.event
 async def on_message(message):
+    # Debug: Log every message we receive
+    print(f"🎯 Received message: '{message.content}' from {message.author.name}")
+    
     # Don't respond to the bot itself
     if message.author == bot.user:
+        print(f"⏭️ Ignoring own message")
         return
     
     # Process commands first (for everyone now)
@@ -598,11 +634,18 @@ async def on_message(message):
     # Check message sentiment and context
     sentiment = analyze_message_sentiment(message.content, bot_mentioned)
     
-    # Check if message contains bad words
-    found_bad_word = any(word in content for word in BAD_WORDS)
+    # Check if message contains bad words (but ignore if from owner)
+    found_bad_word = any(word in content for word in BAD_WORDS) and message.author.id != YOUR_USER_ID
     
     # Check for caps abuse if caps punishment is active
     caps_abuse = caps_punishment_active and is_caps_abuse(message.content)
+    
+    # Check if this looks like a question or casual chat
+    question_indicators = ['?', 'what', 'how', 'when', 'where', 'why', 'who', 'weather', 'temperature', 'help', 'tell me', 'explain']
+    looks_like_question = any(indicator in content for indicator in question_indicators)
+    
+    # Debug logging
+    print(f"📝 Message: '{message.content}' | Bot mentioned: {bot_mentioned} | Looks like question: {looks_like_question}")
     
     # Determine if we should respond and how
     should_respond = False
@@ -627,16 +670,38 @@ async def on_message(message):
         # If bot is mentioned but not hostile or friendly, have a normal conversation
         should_respond = True
         context_type = "conversation"
+    elif looks_like_question and len(message.content) > 5:
+        # Respond to questions even if not mentioned
+        should_respond = True
+        context_type = "conversation"
+        print(f"🔍 Detected question: '{message.content}' - will respond")
     
     if should_respond:
+        print(f"💬 Should respond: {should_respond}, Context: {context_type}")
+        
         # Get AI-generated response
-        ai_response = await get_ai_response(message.content, user_mention, context_type)
+        print(f"🤖 Getting AI response for: '{message.content}'")
         
-        # Send the response
-        await message.channel.send(ai_response)
-        print(f"AI Response sent ({context_type}): {ai_response}")
+        # Add user message to memory
+        add_to_memory(message.author.id, 'user', message.content)
         
-        # Handle timeouts based on context
+        ai_response = await get_ai_response(message.content, user_mention, context_type, message.author.id)
+        print(f"🎤 AI Response received: '{ai_response}'")
+        
+        if ai_response:
+            # Add bot response to memory
+            add_to_memory(message.author.id, 'assistant', ai_response)
+            
+            # Send the response
+            await message.channel.send(ai_response)
+            print(f"✅ AI Response sent ({context_type}): {ai_response}")
+        else:
+            print(f"❌ No AI response generated!")
+    else:
+        print(f"🚫 Should not respond: {should_respond}")
+    
+    # Handle timeouts based on context (only if we responded)
+    if should_respond:
         timeout_applied = False
         
         if context_type == "caps":
@@ -805,7 +870,7 @@ async def manual_timeout(ctx, member: discord.Member, duration, *, reason="Manua
             return
             
         # Apply timeout
-        timeout_until = discord.utils.utcnow() + discord.timedelta(seconds=duration_seconds)
+        timeout_until = discord.utils.utcnow() + timedelta(seconds=duration_seconds)
         await member.timeout(timeout_until, reason=reason)
         
         # Format duration for display
